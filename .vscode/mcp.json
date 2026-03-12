@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "parlay_maker": {
+      "type": "stdio",
+      "command": "/Users/amsan/Downloads/parlay_maker/.venv/bin/python",
+      "args": ["/Users/amsan/Downloads/parlay_maker/scripts/run_server.py"]
+    }
+  }
+}
