@@ -148,7 +148,8 @@ def make_parlay_builder(home_team: str, away_team: str,
                         allow_correlation: bool = False,
                         game_date: str = "",
                         only_player_props: bool = False,
-                        min_confidence: float = 0.0) -> str:
+                        min_confidence: float = 0.0,
+                        include_rejected_legs: bool = False) -> str:
     """
     Build a parlay for an NBA game.
 
@@ -175,6 +176,7 @@ def make_parlay_builder(home_team: str, away_team: str,
         game_date: Optional YYYY-MM-DD
         only_player_props: Only use player prop legs (no moneyline)
         min_confidence: Minimum confidence score for legs (0-1)
+        include_rejected_legs: Include live-verification rejected legs in response
     """
     player_list = [p.strip() for p in players.split(",") if p.strip()] if players else None
     constraints = {}
@@ -182,6 +184,8 @@ def make_parlay_builder(home_team: str, away_team: str,
         constraints["only_player_props"] = True
     if min_confidence > 0:
         constraints["min_confidence"] = min_confidence
+    if include_rejected_legs:
+        constraints["include_rejected_legs"] = True
 
     result = make_parlay_tool(
         home_team, away_team, player_list, number_of_legs,

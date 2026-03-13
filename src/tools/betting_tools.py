@@ -370,6 +370,8 @@ def make_parlay_tool(home_team: str, away_team: str,
     if validation_error:
         return validation_error
 
+    include_rejected_legs = bool(constraints and constraints.get("include_rejected_legs"))
+
     # Build all candidate legs
     legs = build_legs_for_game(home, away, gd, players, risk_mode)
     verified_legs, rejected_legs = verify_legs(
@@ -380,11 +382,13 @@ def make_parlay_tool(home_team: str, away_team: str,
     legs = verified_legs
 
     if not legs:
-        return {
+        response = {
             "error": "No viable legs found. Provide player names or check team data.",
             "suggestion": "Try: make_parlay with players=['LeBron James', 'Anthony Davis']",
-            "rejected_legs": [r.metadata for r in rejected_legs],
         }
+        if include_rejected_legs:
+            response["rejected_legs"] = [r.metadata for r in rejected_legs]
+        return response
 
     # Build parlays
     parlays = make_parlay(legs, number_of_legs, risk_mode, allow_correlation, constraints)
@@ -395,12 +399,14 @@ def make_parlay_tool(home_team: str, away_team: str,
             "available_legs": [leg_to_dict(l) for l in legs[:5]],
         }
 
-    return {
+    response = {
         "parlays": [parlay_to_dict(p) for p in parlays],
         "total_candidates_evaluated": len(legs),
-        "rejected_legs": [r.metadata for r in rejected_legs],
         "disclaimer": DISCLAIMER,
     }
+    if include_rejected_legs:
+        response["rejected_legs"] = [r.metadata for r in rejected_legs]
+    return response
 
 
 # ---------------------------------------------------------------------------
