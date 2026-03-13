@@ -19,8 +19,10 @@ from src.models.predict import (
     predict_player_prop, predict_moneyline, suggest_player_props,
     confidence_score,
 )
-from src.utils.config import resolve_team
+from src.utils.config import ENABLE_LIVE_VERIFICATION
 from src.utils.logger import get_logger
+from src.verification.nba_live import get_live_client
+from src.verification.verify_pick import verify_leg
 
 log = get_logger(__name__)
 
@@ -49,6 +51,7 @@ class Leg:
     projection: float | None = None
     suggested_usage: str = "single only"
     game_key: str = ""          # "HOME_AWAY" for correlation detection
+    verification_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -223,12 +226,29 @@ def build_legs_for_game(home_abbrev: str, away_abbrev: str,
     legs: list[Leg] = []
     game_key = f"{home_abbrev}_{away_abbrev}"
 
+    client = get_live_client() if ENABLE_LIVE_VERIFICATION else None
+    game_context = {
+        "home_team": home_abbrev,
+        "away_team": away_abbrev,
+        "game_date": str(game_date),
+    }
+
+    def append_verified(candidate: Leg) -> None:
+        if not client:
+            legs.append(candidate)
+            return
+        result = verify_leg(candidate, game_context=game_context, client=client)
+        if result.ok:
+            legs.append(result.corrected_leg or candidate)
+            return
+        log.warning("Rejected candidate leg '%s': %s", candidate.description, result.reason)
+
     # Moneyline leg
     ml = predict_moneyline(home_abbrev, away_abbrev, game_date)
     if "error" not in ml:
         fav = home_abbrev if ml["home_win_probability"] > 0.5 else away_abbrev
         prob = max(ml["home_win_probability"], ml["away_win_probability"])
-        legs.append(Leg(
+        append_verified(Leg(
             leg_type="moneyline",
             description=f"{fav} ML",
             team=fav,
@@ -248,20 +268,37 @@ def build_legs_for_game(home_abbrev: str, away_abbrev: str,
     if players:
         for pname in players:
             team_abbrev = None
-            # Try to figure out which team this player is on
-            from src.data.queries import player_recent
-            rec = player_recent(pname, n=1)
-            if not rec.empty:
-                team_abbrev = rec.iloc[0].get("team_abbrev", "")
+            resolved_player = pname
+            is_home = 1
+            opp = away_abbrev
 
-            is_home = 1 if team_abbrev == home_abbrev else 0
-            opp = away_abbrev if is_home else home_abbrev
+            if client:
+                context = client.resolve_player_game_context(
+                    pname,
+                    home_abbrev,
+                    away_abbrev,
+                    str(game_date),
+                )
+                if not context.get("ok"):
+                    log.warning("Skipping player %s due to live verification failure: %s", pname, context.get("reason"))
+                    continue
+                resolved_player = context["player_name"]
+                team_abbrev = context["team_abbrev"]
+                is_home = int(context["is_home"])
+                opp = context["opponent_abbrev"]
+            else:
+                from src.data.queries import player_recent
+                rec = player_recent(pname, n=1)
+                if not rec.empty:
+                    team_abbrev = rec.iloc[0].get("team_abbrev", "")
+                is_home = 1 if team_abbrev == home_abbrev else 0
+                opp = away_abbrev if is_home else home_abbrev
 
-            props = suggest_player_props(pname, opp, game_date, is_home, risk_mode)
+            props = suggest_player_props(resolved_player, opp, game_date, is_home, risk_mode)
             for prop in props:
                 if "error" in prop:
                     continue
-                legs.append(Leg(
+                append_verified(Leg(
                     leg_type="player_prop",
                     description=f"{prop['player']} {prop.get('direction', 'Over')} {prop.get('suggested_line', prop.get('line', '?'))} {prop['stat_type']}",
                     player=prop["player"],
@@ -455,6 +492,7 @@ def leg_to_dict(leg: Leg) -> dict:
         "reasons": leg.reasons,
         "risks": leg.risks,
         "suggested_usage": leg.suggested_usage,
+        "verification": leg.verification_metadata,
     }
 
 

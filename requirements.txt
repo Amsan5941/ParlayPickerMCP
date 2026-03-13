@@ -14,3 +14,4 @@ mcp>=1.0.0
 
 # Utils
 python-dotenv>=1.0.0
+nba_api>=1.7.0
