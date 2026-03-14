@@ -16,6 +16,7 @@ MODEL_DIR = Path(os.getenv("MODEL_DIR", PROJECT_ROOT / "models"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LIVE_CACHE_DIR = Path(os.getenv("LIVE_CACHE_DIR", DATA_DIR / "live"))
 LIVE_CACHE_TTL_HOURS = int(os.getenv("LIVE_CACHE_TTL_HOURS", "12"))
+LIVE_REALTIME_CACHE_TTL_MINUTES = float(os.getenv("LIVE_REALTIME_CACHE_TTL_MINUTES", "10"))
 LIVE_REQUEST_TIMEOUT = int(os.getenv("LIVE_REQUEST_TIMEOUT", "15"))
 LIVE_API_RETRIES = int(os.getenv("LIVE_API_RETRIES", "2"))
 ENABLE_LIVE_VERIFICATION = os.getenv("ENABLE_LIVE_VERIFICATION", "true").strip().lower() in {

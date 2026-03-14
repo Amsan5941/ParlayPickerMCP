@@ -47,6 +47,13 @@ def _attach_metadata(leg: Any, metadata: dict[str, Any]) -> Any:
     return _set_fields(leg, {"verification_metadata": metadata})
 
 
+def _append_leg_risk(leg: Any, risk: str) -> Any:
+    risks = list(_get_field(leg, "risks", []) or [])
+    if risk not in risks:
+        risks.append(risk)
+    return _set_fields(leg, {"risks": risks})
+
+
 def _normalize_game_context(game_context: dict[str, Any] | None, leg: Any) -> dict[str, Any]:
     context = dict(game_context or {})
     context.setdefault("home_team", _get_field(leg, "team"))
@@ -82,6 +89,7 @@ def verify_leg(
         "verified_source": "nba_api",
         "verification_time": _verification_time(),
         "game_validated": False,
+        "availability_checked": False,
     }
 
     if leg_type == "moneyline":
@@ -152,6 +160,25 @@ def verify_leg(
             metadata.update({"reason": game_validation.get("reason")})
             return VerificationResult(ok=False, reason=game_validation.get("reason"), metadata=metadata)
 
+    availability = None
+    if game_date and home and away:
+        availability = client.check_player_availability(
+            current.get("player_name", player_name),
+            home,
+            away,
+            game_date,
+            game_validation=game_validation,
+        )
+        metadata.update({
+            "availability_validation": availability,
+            "availability_checked": bool(availability.get("availability_checked")),
+        })
+        if availability.get("status") == "inactive":
+            metadata.update({"reason": "player_inactive"})
+            return VerificationResult(ok=False, reason="player_inactive", metadata=metadata)
+        if availability.get("reason") == "availability_unavailable":
+            warnings.append("live_availability_unconfirmed")
+
     corrected_team = live_team
     corrected_opponent = _get_field(leg, "opponent")
     if home and away and live_team in {home, away}:
@@ -164,6 +191,11 @@ def verify_leg(
         "team": corrected_team,
         "opponent": corrected_opponent,
     })
+    if availability and availability.get("reason") == "availability_unavailable":
+        corrected_leg = _append_leg_risk(
+            corrected_leg,
+            "Live inactive report unavailable for this game; confirm player status before betting",
+        )
     metadata["verified"] = True
     corrected_leg = _attach_metadata(corrected_leg, metadata)
     return VerificationResult(

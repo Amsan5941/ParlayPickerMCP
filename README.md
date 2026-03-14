@@ -2,6 +2,8 @@
 
 A **local** Model Context Protocol (MCP) server for NBA betting analytics. Provides data-driven matchup analysis, player prop evaluation, moneyline predictions, and parlay generation powered by XGBoost models trained on historical NBA box-score data.
 
+It also includes live verification against official NBA roster, schedule, and same-day inactive-report data so the MCP is less likely to build props around players who are not available for that game.
+
 > **DISCLAIMER:** This is a probabilistic analytics tool, NOT financial advice. Sports betting carries inherent risk. Never bet more than you can afford to lose. Past performance does not predict future results. No bet is guaranteed to win.
 
 ---
@@ -202,7 +204,7 @@ Paste these directly into Claude Desktop:
 
 5. **Parlays:** The parlay engine picks the best legs, checks for dangerous correlations (e.g., two bets that fail together), and scores each combo by estimated hit probability.
 
-6. **Safety:** It explicitly warns about risky legs, low confidence, small samples, and volatile players. It never claims a bet will "definitely hit."
+6. **Safety:** It explicitly warns about risky legs, low confidence, small samples, volatile players, and live verification gaps. It also rejects legs when the live game feed lists the player as inactive. It never claims a bet will "definitely hit."
 
 ---
 
@@ -356,7 +358,7 @@ python scripts/train.py
 
 1. **Live Odds API Integration:** Connect to a sportsbook API (e.g., The Odds API) to automatically pull current lines instead of requiring manual input. Compare model projections against market lines to find edge/value.
 
-2. **Injury/Lineup Integration:** Add a real-time injury feed (e.g., from NBA API or RotoWire) to auto-detect missing players, adjust projections for players inheriting additional minutes/usage.
+2. **Injury/Usage Adjustment:** The MCP now rejects players who appear on the official inactive report for a requested game. A next step would be to re-project teammates for the extra usage/minutes created by those absences.
 
 3. **Position-Based Opponent Defense:** Build a position-level defensive rating model — how many points/rebounds/assists does this team allow to PG vs SG vs SF vs PF vs C? This dramatically improves prop accuracy.
 

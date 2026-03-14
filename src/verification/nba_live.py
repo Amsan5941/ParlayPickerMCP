@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import time
+from datetime import date, datetime
 from functools import lru_cache
 from typing import Any
 
-from nba_api.stats.endpoints import commonteamroster, scoreboardv2
+from nba_api.stats.endpoints import boxscoresummaryv3, commonteamroster, scoreboardv2
 from nba_api.stats.static import players as static_players
 from nba_api.stats.static import teams as static_teams
 
 from src.utils.config import (
     LIVE_API_RETRIES,
+    LIVE_REALTIME_CACHE_TTL_MINUTES,
     LIVE_REQUEST_TIMEOUT,
     LIVE_SEASON,
     VERIFY_SCHEDULES,
@@ -23,6 +25,13 @@ from src.utils.logger import get_logger
 from src.verification.roster_cache import LiveCache
 
 log = get_logger(__name__)
+
+
+def _row_value(row: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in row and row[key] not in {None, ""}:
+            return row[key]
+    return default
 
 
 class NbaLiveClient:
@@ -42,6 +51,7 @@ class NbaLiveClient:
         self._teams = static_teams.get_teams()
         self._team_by_id = {int(team["id"]): team for team in self._teams}
         self._team_by_abbrev = {team["abbreviation"]: team for team in self._teams}
+        self._realtime_ttl_hours = LIVE_REALTIME_CACHE_TTL_MINUTES / 60.0
 
     def _retry(self, fn):
         last_error: Exception | None = None
@@ -141,10 +151,62 @@ class NbaLiveClient:
             })
         return {"game_date": game_date, "games": games}
 
+    def _fetch_game_availability_payload(self, game_id: str, game_date: str | None = None) -> dict[str, Any]:
+        payload = self._retry(
+            lambda: boxscoresummaryv3.BoxScoreSummaryV3(
+                game_id=game_id,
+                timeout=self.timeout,
+            ).get_normalized_dict()
+        )
+        summary_rows = payload.get("GameSummary", [])
+        summary = summary_rows[0] if summary_rows else {}
+        inactive_players: list[dict[str, Any]] = []
+
+        for row in payload.get("InactivePlayers", []):
+            first_name = _row_value(row, "firstName", "FIRST_NAME", default="").strip()
+            last_name = _row_value(row, "familyName", "LAST_NAME", default="").strip()
+            player_name = f"{first_name} {last_name}".strip()
+            if not player_name:
+                player_name = str(_row_value(row, "playerName", "PLAYER_NAME", default="")).strip()
+            if not player_name:
+                continue
+            inactive_players.append({
+                "player_id": int(_row_value(row, "personId", "PLAYER_ID", default=0) or 0),
+                "player_name": player_name,
+                "team_id": int(_row_value(row, "teamId", "TEAM_ID", default=0) or 0),
+                "team_abbrev": _row_value(row, "teamTricode", "TEAM_ABBREVIATION", default=""),
+                "team_name": " ".join(
+                    part for part in [
+                        str(_row_value(row, "teamCity", "TEAM_CITY", default="")).strip(),
+                        str(_row_value(row, "teamName", "TEAM_NAME", default="")).strip(),
+                    ] if part
+                ),
+            })
+
+        return {
+            "game_id": game_id,
+            "game_date": game_date,
+            "game_status_text": _row_value(summary, "gameStatusText", "GAME_STATUS_TEXT", default=""),
+            "game_status_id": _row_value(summary, "gameStatusId", "GAME_STATUS_ID"),
+            "inactive_players": inactive_players,
+        }
+
     @staticmethod
     def _format_game_date(game_date: str) -> str:
         year, month, day = game_date.split("-")
         return f"{month}/{day}/{year}"
+
+    @staticmethod
+    def _is_today(game_date: str | None) -> bool:
+        if not game_date:
+            return False
+        try:
+            return datetime.strptime(game_date, "%Y-%m-%d").date() == date.today()
+        except ValueError:
+            return False
+
+    def _realtime_ttl_for_game_date(self, game_date: str | None) -> float | None:
+        return self._realtime_ttl_hours if self._is_today(game_date) else None
 
     def refresh_players_cache(self, force: bool = False) -> dict[str, Any]:
         result = self.cache.get_or_refresh("players", self._fetch_players_payload, force_refresh=force)
@@ -167,9 +229,32 @@ class NbaLiveClient:
         }
 
     def refresh_schedule_cache(self, game_date: str, force: bool = False) -> dict[str, Any]:
+        ttl_hours = self._realtime_ttl_for_game_date(game_date)
         result = self.cache.get_or_refresh(
             f"schedule_{game_date}",
             lambda: self._fetch_schedule_payload(game_date),
+            ttl_hours=ttl_hours,
+            force_refresh=force,
+        )
+        return {
+            "payload": result.payload,
+            "fetched_at": result.fetched_at,
+            "stale": result.stale,
+            "source": result.source,
+            "warning": result.warning,
+        }
+
+    def refresh_game_availability_cache(
+        self,
+        game_id: str,
+        game_date: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        ttl_hours = self._realtime_ttl_for_game_date(game_date)
+        result = self.cache.get_or_refresh(
+            f"game_availability_{game_id}",
+            lambda: self._fetch_game_availability_payload(game_id, game_date),
+            ttl_hours=ttl_hours,
             force_refresh=force,
         )
         return {
@@ -198,6 +283,9 @@ class NbaLiveClient:
 
     def get_schedule(self, game_date: str) -> dict[str, Any]:
         return self.refresh_schedule_cache(game_date, force=False)["payload"]
+
+    def get_game_availability(self, game_id: str, game_date: str | None = None) -> dict[str, Any]:
+        return self.refresh_game_availability_cache(game_id, game_date=game_date, force=False)
 
     def get_team_roster(self, team_abbr_or_name: str) -> list[dict[str, Any]]:
         team_abbrev = resolve_team(team_abbr_or_name)
@@ -326,6 +414,7 @@ class NbaLiveClient:
                 return {
                     "ok": True,
                     "game_exists": True,
+                    "game_id": game.get("game_id"),
                     "game_date": game_date,
                     "home_team_abbrev": game["home_team_abbrev"],
                     "home_team_name": game["home_team_name"],
@@ -347,6 +436,84 @@ class NbaLiveClient:
             "away_team_name": resolve_team_name(away_abbrev),
             "verified_source": "nba_api",
             "schedule_checked": True,
+        }
+
+    def check_player_availability(
+        self,
+        player_name: str,
+        home_team: str,
+        away_team: str,
+        game_date: str | None,
+        game_validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        validation = game_validation or self.validate_game(home_team, away_team, game_date)
+        if not validation.get("ok"):
+            return {
+                "ok": False,
+                "reason": validation.get("reason", "game_validation_failed"),
+                "verified_source": "nba_api",
+                "game_validation": validation,
+                "availability_checked": False,
+            }
+
+        game_id = validation.get("game_id")
+        resolved_player = self.resolve_player(player_name)
+        resolved_name = resolved_player.get("player_name", player_name) if resolved_player else player_name
+        resolved_player_id = resolved_player.get("player_id") if resolved_player else None
+        if not game_id:
+            return {
+                "ok": True,
+                "player_name": resolved_name,
+                "player_id": resolved_player_id,
+                "status": "unchecked",
+                "availability_checked": False,
+                "reason": "game_id_missing",
+                "verified_source": "nba_api",
+                "game_validation": validation,
+            }
+
+        try:
+            availability = self.get_game_availability(game_id, game_date=game_date)
+        except Exception as exc:
+            log.warning("Live availability check failed for %s in game %s: %s", player_name, game_id, exc)
+            return {
+                "ok": True,
+                "player_name": resolved_name,
+                "player_id": resolved_player_id,
+                "status": "unchecked",
+                "availability_checked": False,
+                "reason": "availability_unavailable",
+                "warning": str(exc),
+                "verified_source": "nba_api",
+                "game_validation": validation,
+            }
+
+        inactive_entry = None
+        lookup_key = normalize_lookup_key(resolved_name)
+        for entry in availability["payload"].get("inactive_players", []):
+            if resolved_player_id and entry.get("player_id") == resolved_player_id:
+                inactive_entry = entry
+                break
+            if normalize_lookup_key(entry.get("player_name", "")) == lookup_key:
+                inactive_entry = entry
+                break
+
+        status = "inactive" if inactive_entry else "not_listed_inactive"
+        return {
+            "ok": True,
+            "player_name": resolved_name,
+            "player_id": resolved_player_id,
+            "status": status,
+            "availability_checked": True,
+            "verified_source": "nba_api",
+            "game_validation": validation,
+            "game_id": game_id,
+            "game_status_text": availability["payload"].get("game_status_text"),
+            "availability_fetched_at": availability.get("fetched_at"),
+            "availability_source": availability.get("source"),
+            "availability_stale": availability.get("stale"),
+            "warning": availability.get("warning"),
+            "inactive_entry": inactive_entry,
         }
 
     def resolve_player_game_context(
@@ -386,6 +553,24 @@ class NbaLiveClient:
                 "game_validation": game_validation,
             }
 
+        availability = self.check_player_availability(
+            player["player_name"],
+            home_abbrev,
+            away_abbrev,
+            game_date,
+            game_validation=game_validation,
+        )
+        if availability.get("status") == "inactive":
+            return {
+                "ok": False,
+                "reason": "player_inactive",
+                "player_name": player["player_name"],
+                "current_team": player.get("current_team"),
+                "current_team_abbrev": live_team,
+                "availability": availability,
+                "game_validation": game_validation,
+            }
+
         actual_home = game_validation.get("home_team_abbrev", home_abbrev)
         is_home = 1 if live_team == actual_home else 0
         opponent = away_abbrev if is_home else home_abbrev
@@ -397,6 +582,7 @@ class NbaLiveClient:
             "team_name": player.get("current_team"),
             "opponent_abbrev": opponent,
             "is_home": is_home,
+            "availability": availability,
             "game_validation": game_validation,
             "verified_source": "nba_api",
         }

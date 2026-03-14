@@ -13,10 +13,19 @@ from src.verification.verify_pick import verify_leg
 
 
 class FakeLiveClient:
-    def __init__(self, team_abbrev: str = "GSW", team_name: str = "Golden State Warriors", game_ok: bool = True):
+    def __init__(
+        self,
+        team_abbrev: str = "GSW",
+        team_name: str = "Golden State Warriors",
+        game_ok: bool = True,
+        availability_status: str = "not_listed_inactive",
+        availability_reason: str | None = None,
+    ):
         self.team_abbrev = team_abbrev
         self.team_name = team_name
         self.game_ok = game_ok
+        self.availability_status = availability_status
+        self.availability_reason = availability_reason
 
     def get_current_team(self, player_name: str) -> dict:
         return {
@@ -41,9 +50,35 @@ class FakeLiveClient:
         return {
             "ok": True,
             "game_exists": True,
+            "game_id": "0022500001",
             "home_team_abbrev": home_team,
             "away_team_abbrev": away_team,
             "game_date": game_date,
+        }
+
+    def check_player_availability(
+        self,
+        player_name: str,
+        home_team: str,
+        away_team: str,
+        game_date: str | None,
+        game_validation: dict | None = None,
+    ) -> dict:
+        inactive_entry = {
+            "player_id": 202710,
+            "player_name": "Jimmy Butler",
+            "team_abbrev": self.team_abbrev,
+        } if self.availability_status == "inactive" else None
+        return {
+            "ok": True,
+            "player_name": "Jimmy Butler",
+            "player_id": 202710,
+            "status": self.availability_status,
+            "availability_checked": self.availability_status != "unchecked",
+            "reason": self.availability_reason,
+            "verified_source": "nba_api",
+            "game_validation": game_validation,
+            "inactive_entry": inactive_entry,
         }
 
 
@@ -135,6 +170,54 @@ class LiveVerificationTests(unittest.TestCase):
         self.assertEqual(result.corrected_leg.team, "GSW")
         self.assertEqual(result.corrected_leg.opponent, "NYK")
         self.assertIn("corrected_team_from_live_data", result.warnings)
+
+    def test_inactive_player_is_rejected(self) -> None:
+        leg = Leg(
+            leg_type="player_prop",
+            description="Jimmy Butler Over 34.5 PRA",
+            player="Jimmy Butler",
+            stat_type="pra",
+            line=34.5,
+            team="GSW",
+            opponent="NYK",
+            game_date=date(2026, 3, 12),
+        )
+
+        result = verify_leg(
+            leg,
+            game_context={"home_team": "GSW", "away_team": "NYK", "game_date": "2026-03-12"},
+            client=FakeLiveClient(team_abbrev="GSW", availability_status="inactive"),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "player_inactive")
+        self.assertTrue(result.metadata["availability_checked"])
+
+    def test_availability_outage_adds_warning_and_risk(self) -> None:
+        leg = Leg(
+            leg_type="player_prop",
+            description="Jimmy Butler Over 34.5 PRA",
+            player="Jimmy Butler",
+            stat_type="pra",
+            line=34.5,
+            team="GSW",
+            opponent="NYK",
+            game_date=date(2026, 3, 12),
+        )
+
+        result = verify_leg(
+            leg,
+            game_context={"home_team": "GSW", "away_team": "NYK", "game_date": "2026-03-12"},
+            client=FakeLiveClient(
+                team_abbrev="GSW",
+                availability_status="unchecked",
+                availability_reason="availability_unavailable",
+            ),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertIn("live_availability_unconfirmed", result.warnings)
+        self.assertIn("Live inactive report unavailable", " ".join(result.corrected_leg.risks))
 
 
 class LiveCacheTests(unittest.TestCase):
