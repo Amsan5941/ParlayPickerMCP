@@ -372,6 +372,14 @@ def make_parlay_tool(home_team: str, away_team: str,
 
     include_rejected_legs = bool(constraints and constraints.get("include_rejected_legs"))
 
+    # Auto-discover top players when none provided
+    if not players:
+        client_for_discovery = get_live_client() if ENABLE_LIVE_VERIFICATION else None
+        if client_for_discovery:
+            players = client_for_discovery.get_top_players_for_game(home, away)
+        if not players:
+            log.info("No players provided and auto-discovery returned nothing — moneyline only.")
+
     # Build all candidate legs
     legs = build_legs_for_game(home, away, gd, players, risk_mode)
     verified_legs, rejected_legs = verify_legs(
@@ -500,6 +508,13 @@ def find_best_legs_tool(home_team: str, away_team: str,
     validation_error = _validate_requested_game(home, away, gd)
     if validation_error:
         return validation_error
+
+    # Auto-discover top players when none provided
+    if not players:
+        client_for_discovery = get_live_client() if ENABLE_LIVE_VERIFICATION else None
+        if client_for_discovery:
+            players = client_for_discovery.get_top_players_for_game(home, away)
+
     all_legs = build_legs_for_game(home, away, gd, players, risk_mode)
     rejected_legs = []
     if ENABLE_LIVE_VERIFICATION:
@@ -543,6 +558,13 @@ def fade_risky_legs_tool(home_team: str, away_team: str,
     validation_error = _validate_requested_game(home, away, gd)
     if validation_error:
         return validation_error
+
+    # Auto-discover top players when none provided
+    if not players:
+        client_for_discovery = get_live_client() if ENABLE_LIVE_VERIFICATION else None
+        if client_for_discovery:
+            players = client_for_discovery.get_top_players_for_game(home, away)
+
     all_legs = build_legs_for_game(home, away, gd, players)
     rejected_legs = []
     if ENABLE_LIVE_VERIFICATION:

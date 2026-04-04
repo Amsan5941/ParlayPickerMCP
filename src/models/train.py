@@ -29,6 +29,7 @@ from src.features.engineering import (
     player_rolling_features, player_opponent_features,
     player_rest_features, player_starter_signal,
     team_rolling_features, team_defensive_features, team_rest_features,
+    opponent_defensive_features, _add_derived_stats,
     STAT_COLS,
 )
 from src.utils.config import MODEL_DIR
@@ -75,6 +76,28 @@ def _build_player_training_rows(target_col: str, min_minutes: float = 10.0,
     # Ensure game_date is datetime for comparisons
     df["game_date"] = pd.to_datetime(df["game_date"])
 
+    # Derived combo stats
+    df = _add_derived_stats(df)
+
+    # Pre-compute per-game opponent defensive stats (leakage-free rolling averages)
+    # Aggregate: for each (opp_abbrev, game_date) sum all stats allowed
+    def_per_game = df.groupby(["opp_abbrev", "game_date"])[
+        ["points", "reboundsTotal", "assists", "threePointersMade", "steals", "blocks"]
+    ].sum().reset_index().rename(columns={
+        "points": "pts_allowed", "reboundsTotal": "reb_allowed",
+        "assists": "ast_allowed", "threePointersMade": "threes_allowed",
+        "steals": "steals_allowed", "blocks": "blocks_allowed",
+    })
+    def_per_game = def_per_game.sort_values(["opp_abbrev", "game_date"])
+    for col in ["pts_allowed", "reb_allowed", "ast_allowed",
+                "threes_allowed", "steals_allowed", "blocks_allowed"]:
+        for w in [5, 10]:
+            def_per_game[f"opp_{col}_avg_{w}"] = (
+                def_per_game.groupby("opp_abbrev")[col]
+                .transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
+            )
+    def_lookup = def_per_game.set_index(["opp_abbrev", "game_date"])
+
     log.info("Building player training data for '%s' (%d raw rows)...", target_col, len(df))
 
     rows = []
@@ -110,6 +133,19 @@ def _build_player_training_rows(target_col: str, min_minutes: float = 10.0,
             opp = target_row.get("opp_abbrev", "")
             vs = history[history["opp_abbrev"] == opp]
             feats.update(player_opponent_features(vs))
+
+            # Opponent defensive features (pre-computed, leakage-free)
+            try:
+                def_row = def_lookup.loc[(opp, target_row["game_date"])]
+                for feat_col in [c for c in def_per_game.columns
+                                 if c.startswith("opp_") and c.endswith(("_5", "_10"))]:
+                    val = def_row.get(feat_col) if isinstance(def_row, dict) else (
+                        def_row[feat_col] if feat_col in def_row.index else None
+                    )
+                    if val is not None and not pd.isna(val):
+                        feats[feat_col] = float(val)
+            except (KeyError, TypeError):
+                pass
 
             feats["target"] = float(target_val)
             feats["game_date"] = target_row["game_date"]
@@ -339,10 +375,15 @@ def train_all_models() -> dict:
 
     # --- Player prop models ---
     prop_targets = {
-        "player_points": "points",
+        "player_points":   "points",
         "player_rebounds": "reboundsTotal",
-        "player_assists": "assists",
-        "player_pra": "pra",
+        "player_assists":  "assists",
+        "player_pra":      "pra",
+        "player_pa":       "pa",
+        "player_ra":       "ra",
+        "player_threes":   "threePointersMade",
+        "player_steals":   "steals",
+        "player_blocks":   "blocks",
     }
     for model_name, target_col in prop_targets.items():
         log.info("=== Training %s ===", model_name)
@@ -362,10 +403,15 @@ def train_all_models() -> dict:
 def train_single_model(model_name: str) -> dict:
     """Train a single model by name."""
     prop_targets = {
-        "player_points": "points",
+        "player_points":   "points",
         "player_rebounds": "reboundsTotal",
-        "player_assists": "assists",
-        "player_pra": "pra",
+        "player_assists":  "assists",
+        "player_pra":      "pra",
+        "player_pa":       "pa",
+        "player_ra":       "ra",
+        "player_threes":   "threePointersMade",
+        "player_steals":   "steals",
+        "player_blocks":   "blocks",
     }
 
     if model_name in prop_targets:

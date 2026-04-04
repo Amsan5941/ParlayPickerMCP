@@ -516,6 +516,66 @@ class NbaLiveClient:
             "inactive_entry": inactive_entry,
         }
 
+    def get_top_players_for_game(
+        self,
+        home_abbrev: str,
+        away_abbrev: str,
+        max_per_team: int = 6,
+        min_minutes: float = 18.0,
+    ) -> list[str]:
+        """
+        Return the top active players for both teams in a game, ranked by recent
+        average minutes. Uses historical DB data (fast, one query per team) and
+        cross-references against the live roster so traded players are excluded.
+
+        Falls back gracefully: if the live roster is unavailable, returns DB players only.
+        """
+        from src.data.ingest import get_connection
+        con = get_connection()
+
+        # Try to get the live roster for cross-referencing
+        try:
+            home_roster = {
+                p["player_name"] for p in self.get_team_roster(home_abbrev)
+            }
+            away_roster = {
+                p["player_name"] for p in self.get_team_roster(away_abbrev)
+            }
+        except Exception:
+            home_roster = set()
+            away_roster = set()
+
+        result: list[str] = []
+        for team_abbrev, live_roster in [
+            (home_abbrev, home_roster),
+            (away_abbrev, away_roster),
+        ]:
+            q = """
+                SELECT player_name, AVG(numMinutes) AS avg_min, COUNT(*) AS games
+                FROM player_box
+                WHERE team_abbrev = ?
+                GROUP BY player_name
+                HAVING AVG(numMinutes) >= ? AND COUNT(*) >= 5
+                ORDER BY avg_min DESC
+                LIMIT ?
+            """
+            df = con.execute(q, [team_abbrev, min_minutes, max_per_team * 2]).fetchdf()
+            if df.empty:
+                continue
+
+            picked = 0
+            for _, row in df.iterrows():
+                pname = row["player_name"]
+                # If live roster loaded, only include players still on the team
+                if live_roster and pname not in live_roster:
+                    continue
+                result.append(pname)
+                picked += 1
+                if picked >= max_per_team:
+                    break
+
+        return result
+
     def resolve_player_game_context(
         self,
         player_name: str,

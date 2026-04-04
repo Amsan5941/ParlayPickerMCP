@@ -15,7 +15,7 @@ from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-STAT_COLS = ["points", "reboundsTotal", "assists", "pra",
+STAT_COLS = ["points", "reboundsTotal", "assists", "pra", "pa", "ra",
              "threePointersMade", "steals", "blocks", "numMinutes",
              "fieldGoalsMade", "fieldGoalsAttempted",
              "freeThrowsMade", "freeThrowsAttempted"]
@@ -78,7 +78,7 @@ def player_rolling_features(game_log: pd.DataFrame,
             feats["minutes_std_10"] = float(mins.std())
 
     # Consistency score = 1 - (CV)  (lower variance vs mean = more consistent)
-    for col in ["points", "pra"]:
+    for col in ["points", "pra", "pa", "ra", "threePointersMade", "steals", "blocks"]:
         if col not in gl.columns:
             continue
         vals = pd.to_numeric(gl[col].head(10), errors="coerce").fillna(0)
@@ -176,6 +176,66 @@ def percentile_estimate(game_log: pd.DataFrame, stat_col: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Opponent defensive features (for player prop accuracy)
+# ---------------------------------------------------------------------------
+
+def opponent_defensive_features(opp_abbrev: str, target_date: date,
+                                 windows: list[int] = [5, 10]) -> dict:
+    """
+    How many total pts/reb/ast/threes/steals/blocks does opp_abbrev allow per game?
+
+    Aggregates player_box rows where opp_abbrev was the defending team,
+    grouped by game_date, then computes rolling averages over requested windows.
+    All data is strictly before target_date to prevent leakage.
+    """
+    from src.data.ingest import get_connection
+    con = get_connection()
+
+    q = """
+        SELECT game_date,
+               SUM(points)           AS pts_allowed,
+               SUM(reboundsTotal)    AS reb_allowed,
+               SUM(assists)          AS ast_allowed,
+               SUM(threePointersMade) AS threes_allowed,
+               SUM(steals)           AS steals_allowed,
+               SUM(blocks)           AS blocks_allowed
+        FROM player_box
+        WHERE opp_abbrev = ?
+          AND game_date < ?
+        GROUP BY game_date
+        ORDER BY game_date DESC
+    """
+    df = con.execute(q, [opp_abbrev, str(target_date)]).fetchdf()
+    if df.empty:
+        return {}
+
+    feats: dict = {}
+    col_map = {
+        "pts_allowed":    "opp_pts_allowed",
+        "reb_allowed":    "opp_reb_allowed",
+        "ast_allowed":    "opp_ast_allowed",
+        "threes_allowed": "opp_threes_allowed",
+        "steals_allowed": "opp_steals_allowed",
+        "blocks_allowed": "opp_blocks_allowed",
+    }
+    for w in windows:
+        sub = df.head(w)
+        if sub.empty:
+            continue
+        for src_col, feat_prefix in col_map.items():
+            if src_col in sub.columns:
+                feats[f"{feat_prefix}_avg_{w}"] = float(
+                    pd.to_numeric(sub[src_col], errors="coerce").fillna(0).mean()
+                )
+
+    # Defensive rating proxy: pts allowed relative to league average (~220 per game)
+    if "opp_pts_allowed_avg_10" in feats:
+        feats["opp_def_rating_proxy"] = feats["opp_pts_allowed_avg_10"] / 220.0
+
+    return feats
+
+
+# ---------------------------------------------------------------------------
 # Team features
 # ---------------------------------------------------------------------------
 
@@ -264,6 +324,20 @@ def team_rest_features(team_log: pd.DataFrame, target_date: date) -> dict:
 # Full feature vector builders
 # ---------------------------------------------------------------------------
 
+def _add_derived_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Add pa (points+assists) and ra (rebounds+assists) columns if base columns exist."""
+    if df.empty:
+        return df
+    df = df.copy()
+    if "points" in df.columns and "assists" in df.columns:
+        df["pa"] = pd.to_numeric(df["points"], errors="coerce").fillna(0) + \
+                   pd.to_numeric(df["assists"], errors="coerce").fillna(0)
+    if "reboundsTotal" in df.columns and "assists" in df.columns:
+        df["ra"] = pd.to_numeric(df["reboundsTotal"], errors="coerce").fillna(0) + \
+                   pd.to_numeric(df["assists"], errors="coerce").fillna(0)
+    return df
+
+
 def build_player_feature_vector(player_name: str, opp_abbrev: str,
                                  target_date: date, is_home: int,
                                  stat_type: str = "points",
@@ -274,6 +348,10 @@ def build_player_feature_vector(player_name: str, opp_abbrev: str,
     # Get game logs
     recent = player_recent(player_name, n=30)
     vs_opp = player_vs_opponent(player_name, opp_abbrev, n=10)
+
+    # Add derived combo stats (pa, ra) to game logs
+    recent = _add_derived_stats(recent)
+    vs_opp = _add_derived_stats(vs_opp)
 
     feats: dict = {"is_home": is_home}
 
@@ -301,6 +379,10 @@ def build_player_feature_vector(player_name: str, opp_abbrev: str,
     # Hit rate if line provided
     if line is not None:
         feats.update(hit_rate_at_line(recent, actual_col, line))
+
+    # Opponent defensive features (how many pts/reb/ast does this opponent allow?)
+    if opp_abbrev:
+        feats.update(opponent_defensive_features(opp_abbrev, target_date))
 
     return feats
 

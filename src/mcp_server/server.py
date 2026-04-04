@@ -86,19 +86,21 @@ def evaluate_player_prop_tool(player_name: str, stat_type: str,
     """
     Evaluate a player prop bet.
 
-    Returns: projection, hit probability, confidence tier, reasons,
-    risks, percentiles, and suggested usage.
+    Returns: projection, projection_std, hit probability, confidence tier,
+    value_score (edge-weighted), reasons, risks, percentiles, and suggested usage.
 
-    Stat types: points, rebounds, assists, pra, threes, steals, blocks
+    Stat types: points, rebounds, assists, pra, pa (pts+ast), ra (reb+ast),
+                threes, steals, blocks
 
     Examples:
       - evaluate_player_prop_tool("LeBron James", "points", 27.5, "Celtics")
       - evaluate_player_prop_tool("Jokic", "pra", 46.5, "Lakers", "2026-03-15")
-      - evaluate_player_prop_tool("Tatum", "points", 29.5, "Heat", over_under="over")
+      - evaluate_player_prop_tool("Tatum", "pa", 38.5, "Heat", over_under="over")
+      - evaluate_player_prop_tool("Curry", "threes", 4.5, "Lakers")
 
     Args:
         player_name: Full or partial player name
-        stat_type: points, rebounds, assists, pra, threes, steals, blocks
+        stat_type: points, rebounds, assists, pra, pa, ra, threes, steals, blocks
         line: Betting line value (0 = no line, will return projection + suggested lines)
         opponent: Opponent team name
         game_date: Optional YYYY-MM-DD
@@ -119,14 +121,21 @@ def suggest_props_tool(player_name: str, opponent: str = "",
     """
     Suggest the best prop bets for a player in their next game.
 
-    Returns ranked prop ideas across all stat categories with estimated
-    hit probabilities and confidence tiers.
+    Returns ranked prop ideas across ALL stat categories — points, rebounds,
+    assists, PRA, PA (pts+ast), RA (reb+ast), threes, steals, blocks — with
+    hit probabilities, value_score (edge-weighted), and confidence tiers.
 
-    Risk modes: safe (conservative lines), balanced, aggressive (higher upside)
+    Lines are snapped to realistic 0.5 sportsbook increments.
+
+    Risk modes:
+      - safe: conservative lines (~12% below projection), highest hit probability
+      - balanced: lines ~6% below projection, good balance of value and safety
+      - aggressive: lines near/above projection, higher upside
 
     Examples:
       - suggest_props_tool("Anthony Davis", "Warriors")
       - suggest_props_tool("Tatum", "Heat", risk_mode="safe")
+      - suggest_props_tool("Curry", "Suns", risk_mode="balanced")
 
     Args:
         player_name: Player name
@@ -153,23 +162,32 @@ def make_parlay_builder(home_team: str, away_team: str,
     """
     Build a parlay for an NBA game.
 
-    Generates ranked parlays with per-leg confidence, correlation warnings,
-    combined hit probability, and risk explanations.
+    Generates ranked parlays with per-leg confidence, edge-weighted value_score,
+    correlation warnings, combined hit probability, and risk explanations.
+
+    Players are AUTO-DISCOVERED from the live roster when not provided — just
+    pass the two teams and the system finds the top starters automatically.
+
+    Legs are ranked by value_score (hit probability + edge cushion) and filtered
+    for minimum edge (projection must meaningfully exceed the line). Parlays are
+    diversified across stat types for better independence.
+
+    Covers all prop types: points, rebounds, assists, PRA, PA, RA, threes, steals, blocks.
 
     Risk modes:
-      - safe: High-confidence legs only, max 2 legs
-      - balanced: Mix of confidence and value, max 3 legs
-      - aggressive: Higher upside, more variance, up to 6 legs
+      - safe: High-confidence, min 6% edge, max 2 legs
+      - balanced: min 3% edge, max 3 legs
+      - aggressive: No edge filter, up to 6 legs
 
     Examples:
+      - make_parlay_builder("Lakers", "Celtics")  ← auto-discovers players!
       - make_parlay_builder("Lakers", "Celtics", "LeBron James,Anthony Davis,Jayson Tatum", 2, "safe")
-      - make_parlay_builder("Knicks", "Heat", "Jalen Brunson,Bam Adebayo", 3, "balanced")
-      - make_parlay_builder("Nuggets", "Suns", "Jokic,Booker,Murray,Durant", 4, "aggressive", True)
+      - make_parlay_builder("Knicks", "Heat", number_of_legs=3, risk_mode="balanced")
 
     Args:
         home_team: Home team
         away_team: Away team
-        players: Comma-separated player names (important for prop legs!)
+        players: Comma-separated player names (leave empty to auto-discover)
         number_of_legs: 2-6
         risk_mode: safe/balanced/aggressive
         allow_correlation: Allow correlated legs in same game
@@ -233,18 +251,20 @@ def find_best_legs_on_slate(home_team: str, away_team: str,
                             min_confidence: float = 0.45,
                             game_date: str = "") -> str:
     """
-    Find the strongest legs for a game or slate.
+    Find the strongest legs for a game, ranked by value_score (edge + hit probability).
 
-    Returns top candidate legs ranked by confidence score.
+    Players are AUTO-DISCOVERED when not provided. Covers all prop types:
+    points, rebounds, assists, PRA, PA (pts+ast), RA (reb+ast), threes, steals, blocks.
 
     Examples:
+      - find_best_legs_on_slate("Lakers", "Celtics")  ← auto-discovers players!
       - find_best_legs_on_slate("Lakers", "Celtics", "LeBron,Tatum,Brown,AD")
-      - find_best_legs_on_slate("Knicks", "Heat", "Brunson,Bam", stat_types="points,pra")
+      - find_best_legs_on_slate("Knicks", "Heat", stat_types="points,pra,pa")
 
     Args:
         home_team: Home team
         away_team: Away team
-        players: Comma-separated player names
+        players: Comma-separated player names (leave empty to auto-discover)
         risk_mode: safe/balanced/aggressive
         stat_types: Comma-separated stat types to filter (empty = all)
         min_confidence: Minimum confidence threshold

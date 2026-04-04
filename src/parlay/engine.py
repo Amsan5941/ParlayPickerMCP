@@ -49,6 +49,8 @@ class Leg:
     reasons: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     projection: float | None = None
+    projection_std: float | None = None   # used for edge scoring
+    value_score: float = 0.0              # edge-weighted composite score
     suggested_usage: str = "single only"
     game_key: str = ""          # "HOME_AWAY" for correlation detection
     verification_metadata: dict = field(default_factory=dict)
@@ -66,6 +68,37 @@ class Parlay:
     reasoning: str
     warnings: list[str] = field(default_factory=list)
     alternatives: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Value scoring
+# ---------------------------------------------------------------------------
+
+def compute_value_score(leg: "Leg") -> float:
+    """
+    Edge-weighted composite score for ranking legs.
+
+    value_score = hit_probability * 0.5 + edge_factor * 0.35 + confidence_score * 0.15
+
+    edge_factor = how many standard deviations the projection clears the line,
+                  capped at 1.0 (≥2 std above/below = full edge credit).
+    """
+    hit_prob = leg.hit_probability
+    conf = leg.confidence_score
+
+    if (leg.projection is not None and leg.line is not None
+            and leg.projection_std is not None and leg.projection_std > 0):
+        direction = 1.0 if (leg.over_under or "over") == "over" else -1.0
+        raw_edge = direction * (leg.projection - leg.line) / leg.projection_std
+        edge_factor = min(max(raw_edge / 2.0, 0.0), 1.0)
+    elif leg.projection is not None and leg.line is not None:
+        # Fallback: relative edge as % of line
+        direction = 1.0 if (leg.over_under or "over") == "over" else -1.0
+        edge_factor = min(max(direction * (leg.projection - leg.line) / max(leg.line, 1.0) * 5, 0.0), 1.0)
+    else:
+        edge_factor = 0.0
+
+    return round(hit_prob * 0.5 + edge_factor * 0.35 + conf * 0.15, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -137,10 +170,10 @@ def filter_legs(legs: list[Leg], constraints: dict | None = None) -> list[Leg]:
 
     Constraints:
       min_confidence: float (0–1), default 0.45
+      min_edge_ratio: float (0–1) — minimum (projection-line)/line edge, default 0.0
       only_player_props: bool
       only_one_per_player: bool
       avoid_bench: bool (exclude players with < 25 avg minutes)
-      avoid_low_minutes: bool
       stat_types: list[str] or None
       max_legs_per_game: int
     """
@@ -148,10 +181,16 @@ def filter_legs(legs: list[Leg], constraints: dict | None = None) -> list[Leg]:
         constraints = {}
 
     min_conf = constraints.get("min_confidence", 0.45)
+    min_edge = constraints.get("min_edge_ratio", 0.0)
     only_props = constraints.get("only_player_props", False)
     one_per_player = constraints.get("only_one_per_player", True)
     avoid_bench = constraints.get("avoid_bench", True)
     stat_types = constraints.get("stat_types", None)
+
+    # Ensure value_score is populated
+    for leg in legs:
+        if leg.value_score == 0.0:
+            leg.value_score = compute_value_score(leg)
 
     filtered = []
     seen_players = set()
@@ -160,6 +199,13 @@ def filter_legs(legs: list[Leg], constraints: dict | None = None) -> list[Leg]:
         # Confidence threshold
         if leg.confidence_score < min_conf:
             continue
+
+        # Edge ratio filter (projection must clear line by at least min_edge %)
+        if min_edge > 0 and leg.projection is not None and leg.line is not None and leg.line > 0:
+            direction = 1.0 if (leg.over_under or "over") == "over" else -1.0
+            ratio = direction * (leg.projection - leg.line) / leg.line
+            if ratio < min_edge:
+                continue
 
         # Only player props
         if only_props and leg.leg_type != "player_prop":
@@ -191,6 +237,7 @@ def filter_legs(legs: list[Leg], constraints: dict | None = None) -> list[Leg]:
 RISK_CONFIGS = {
     "safe": {
         "min_confidence": 0.55,
+        "min_edge_ratio": 0.06,   # projection must be ≥6% above the line
         "avoid_bench": True,
         "only_one_per_player": True,
         "prefer_high_consistency": True,
@@ -198,6 +245,7 @@ RISK_CONFIGS = {
     },
     "balanced": {
         "min_confidence": 0.45,
+        "min_edge_ratio": 0.03,   # projection must be ≥3% above the line
         "avoid_bench": True,
         "only_one_per_player": True,
         "prefer_high_consistency": False,
@@ -205,6 +253,7 @@ RISK_CONFIGS = {
     },
     "aggressive": {
         "min_confidence": 0.35,
+        "min_edge_ratio": 0.0,
         "avoid_bench": False,
         "only_one_per_player": False,
         "prefer_high_consistency": False,
@@ -298,9 +347,9 @@ def build_legs_for_game(home_abbrev: str, away_abbrev: str,
             for prop in props:
                 if "error" in prop:
                     continue
-                append_verified(Leg(
+                leg = Leg(
                     leg_type="player_prop",
-                    description=f"{prop['player']} {prop.get('direction', 'Over')} {prop.get('suggested_line', prop.get('line', '?'))} {prop['stat_type']}",
+                    description=f"{prop['player']} {prop.get('direction', 'Over').title()} {prop.get('suggested_line', prop.get('line', '?'))} {prop['stat_type'].upper()}",
                     player=prop["player"],
                     stat_type=prop["stat_type"],
                     line=prop.get("suggested_line", prop.get("line")),
@@ -314,9 +363,12 @@ def build_legs_for_game(home_abbrev: str, away_abbrev: str,
                     reasons=prop.get("reasons", []),
                     risks=prop.get("risks", []),
                     projection=prop.get("projection"),
+                    projection_std=prop.get("projection_std"),
                     suggested_usage=prop.get("suggested_usage", "single only"),
                     game_key=game_key,
-                ))
+                )
+                leg.value_score = compute_value_score(leg)
+                append_verified(leg)
 
     return legs
 
@@ -349,8 +401,11 @@ def make_parlay(legs: list[Leg], num_legs: int = 2,
     if len(filtered) < actual_legs:
         return []
 
-    # Sort by confidence
-    filtered.sort(key=lambda x: x.confidence_score, reverse=True)
+    # Ensure value scores are computed, then sort by value_score
+    for leg in filtered:
+        if leg.value_score == 0.0:
+            leg.value_score = compute_value_score(leg)
+    filtered.sort(key=lambda x: x.value_score, reverse=True)
 
     # Generate combinations
     parlays: list[Parlay] = []
@@ -370,6 +425,12 @@ def make_parlay(legs: list[Leg], num_legs: int = 2,
         # Skip very low probability parlays
         if adj < 0.05:
             continue
+
+        # Diversity bonus: reward combinations with different stat types
+        prop_legs = [l for l in combo_list if l.leg_type == "player_prop"]
+        stat_types_used = [l.stat_type for l in prop_legs if l.stat_type]
+        diversity = len(set(stat_types_used)) / max(len(stat_types_used), 1) if stat_types_used else 1.0
+        adj = adj * (0.92 + 0.08 * diversity)  # up to +8% for fully diverse stat types
 
         warnings = []
         if pen > 0.10:
@@ -428,7 +489,7 @@ def find_best_legs(all_legs: list[Leg], risk_mode: str = "balanced",
                    stat_types: list[str] | None = None,
                    min_confidence: float = 0.45,
                    top_n: int = 10) -> list[Leg]:
-    """Find the top candidate legs ranked by confidence."""
+    """Find the top candidate legs ranked by value_score (edge + hit probability)."""
     constraints = {
         "min_confidence": min_confidence,
         "stat_types": stat_types,
@@ -436,7 +497,10 @@ def find_best_legs(all_legs: list[Leg], risk_mode: str = "balanced",
         "avoid_bench": risk_mode != "aggressive",
     }
     filtered = filter_legs(all_legs, constraints)
-    filtered.sort(key=lambda x: x.confidence_score, reverse=True)
+    for leg in filtered:
+        if leg.value_score == 0.0:
+            leg.value_score = compute_value_score(leg)
+    filtered.sort(key=lambda x: x.value_score, reverse=True)
     return filtered[:top_n]
 
 
@@ -486,9 +550,11 @@ def leg_to_dict(leg: Leg) -> dict:
         "team": leg.team,
         "opponent": leg.opponent,
         "projection": leg.projection,
+        "projection_std": leg.projection_std,
         "hit_probability": leg.hit_probability,
         "confidence_tier": leg.confidence_tier,
         "confidence_score": leg.confidence_score,
+        "value_score": leg.value_score,
         "reasons": leg.reasons,
         "risks": leg.risks,
         "suggested_usage": leg.suggested_usage,

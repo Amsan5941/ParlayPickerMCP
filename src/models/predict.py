@@ -17,6 +17,7 @@ from src.features.engineering import (
     build_game_feature_vector,
     percentile_estimate,
     hit_rate_at_line,
+    _add_derived_stats,
 )
 from src.data.queries import player_recent, find_player_name
 from src.utils.config import MODEL_DIR, resolve_team
@@ -91,14 +92,27 @@ def predict_player_prop(player_name: str, stat_type: str, line: float | None,
     player_name = resolved
 
     stat_col_map = {
-        "points": "points", "rebounds": "reboundsTotal",
-        "assists": "assists", "pra": "pra",
-        "threes": "threePointersMade", "steals": "steals", "blocks": "blocks",
+        "points":   "points",
+        "rebounds": "reboundsTotal",
+        "assists":  "assists",
+        "pra":      "pra",
+        "pa":       "pa",
+        "ra":       "ra",
+        "threes":   "threePointersMade",
+        "steals":   "steals",
+        "blocks":   "blocks",
     }
     actual_col = stat_col_map.get(stat_type, stat_type)
     model_name_map = {
-        "points": "player_points", "rebounds": "player_rebounds",
-        "assists": "player_assists", "pra": "player_pra",
+        "points":   "player_points",
+        "rebounds": "player_rebounds",
+        "assists":  "player_assists",
+        "pra":      "player_pra",
+        "pa":       "player_pa",
+        "ra":       "player_ra",
+        "threes":   "player_threes",
+        "steals":   "player_steals",
+        "blocks":   "player_blocks",
     }
 
     # Build features
@@ -106,8 +120,8 @@ def predict_player_prop(player_name: str, stat_type: str, line: float | None,
         player_name, opp_abbrev, game_date, is_home, stat_type, line
     )
 
-    # Get recent data for analysis
-    recent = player_recent(player_name, n=20)
+    # Get recent data for analysis (add derived combo stats)
+    recent = _add_derived_stats(player_recent(player_name, n=20))
     recent_vals = pd.to_numeric(recent[actual_col], errors="coerce").fillna(0).values if actual_col in recent.columns else np.array([])
 
     # Model prediction
@@ -131,23 +145,29 @@ def predict_player_prop(player_name: str, stat_type: str, line: float | None,
     # Hit probability estimation
     hit_prob = 0.5
     if line is not None and len(recent_vals) >= 5:
-        # Combine model-based estimate with empirical hit rate
+        # Combine model-based estimate with empirical hit rate.
+        # Give more weight to empirical when sample is large (≥15 games).
         if over_under == "over":
             model_prob = _estimate_over_prob(projection, line, recent_vals)
-        else:
-            model_prob = _estimate_under_prob(projection, line, recent_vals)
-        # Empirical
-        if over_under == "over":
             emp_rate = float((recent_vals > line).mean())
         else:
+            model_prob = _estimate_under_prob(projection, line, recent_vals)
             emp_rate = float((recent_vals < line).mean())
-        # Blend: 60% model + 40% empirical
-        hit_prob = 0.6 * model_prob + 0.4 * emp_rate
+
+        if len(recent_vals) >= 15:
+            # Large sample: trust empirical more
+            hit_prob = 0.4 * model_prob + 0.6 * emp_rate
+        else:
+            # Small sample: trust model more
+            hit_prob = 0.6 * model_prob + 0.4 * emp_rate
     elif line is not None:
         if over_under == "over":
             hit_prob = _estimate_over_prob(projection, line, recent_vals)
         else:
             hit_prob = _estimate_under_prob(projection, line, recent_vals)
+
+    # Projection std (used downstream for edge scoring)
+    projection_std = float(recent_vals.std()) if len(recent_vals) >= 3 else 3.0
 
     # Consistency
     consistency = feats.get(f"{actual_col}_consistency",
@@ -170,6 +190,7 @@ def predict_player_prop(player_name: str, stat_type: str, line: float | None,
         "line": line,
         "over_under": over_under,
         "projection": round(projection, 1),
+        "projection_std": round(projection_std, 2),
         "hit_probability": round(hit_prob, 3),
         "confidence_tier": tier,
         "confidence_score": round(score, 3),
@@ -376,7 +397,8 @@ def suggest_player_props(player_name: str, opp_abbrev: str,
         return [{"error": f"Player not found: {player_name}"}]
     player_name = resolved
 
-    stat_types = ["points", "rebounds", "assists", "pra", "threes"]
+    stat_types = ["points", "rebounds", "assists", "pra", "pa", "ra",
+                  "threes", "steals", "blocks"]
     suggestions = []
 
     for st in stat_types:
@@ -392,19 +414,19 @@ def suggest_player_props(player_name: str, opp_abbrev: str,
         if proj is None or proj <= 0:
             continue
 
-        # Suggest lines based on risk mode
+        # Suggest lines snapped to realistic 0.5 sportsbook increments
         if risk_mode == "safe":
-            # Conservative: suggest line below projection
-            line = round(proj * 0.9 - 0.5, 1)
-            direction = "over"
+            # Conservative: set line ~10% below projection for cushion
+            raw = proj * 0.88
         elif risk_mode == "aggressive":
-            # Aggressive: suggest line above projection
-            line = round(proj * 1.05 + 0.5, 1)
-            direction = "over"
+            # Aggressive: line slightly above projection for upside
+            raw = proj * 1.05
         else:
-            # Balanced: use projection as line
-            line = round(proj - 0.5, 1)
-            direction = "over"
+            # Balanced: line just below projection
+            raw = proj * 0.94
+        # Snap to nearest 0.5 increment
+        line = round(raw * 2) / 2
+        direction = "over"
 
         # Re-predict with the suggested line
         with_line = predict_player_prop(
